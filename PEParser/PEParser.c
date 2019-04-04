@@ -35,7 +35,7 @@ int MapPEFile(const char* FilePath, HANDLE* FileHandle, HANDLE* MappingHandle, B
         goto cleanup;
     }
     rollback = 1;
-    
+
     if (!GetFileSizeEx(fileHandle, &fileSize))
     {
         PrintError(GetLastError(), "GetFileSizeEx");
@@ -103,6 +103,41 @@ void UnmapPEFile(HANDLE FileHandle, HANDLE MappingHandle)
     CloseHandle(MappingHandle);
 }
 
+DWORD ConvertRVAToFa(DWORD SectionPA, DWORD SectionVA, DWORD VA)
+{
+    return SectionPA + VA - SectionVA;
+}
+
+BOOL IsInSection(DWORD SectionVA, DWORD SectionSize, DWORD VA)
+{
+    return SectionVA <= VA && SectionVA + SectionSize > VA;
+}
+
+BOOL FindPA(const IMAGE_SECTION_HEADER* imageSectionHeaders, DWORD NumberOfSections, DWORD VA, DWORD* PA)
+{
+    if (NULL == imageSectionHeaders || NULL == PA)
+        return FALSE;
+
+    for (int i = 0; i < NumberOfSections; i++)
+    {
+
+        if (IsInSection(
+            imageSectionHeaders[i].VirtualAddress,
+            imageSectionHeaders[i].Misc.VirtualSize,
+            VA))
+        {
+            *PA = ConvertRVAToFa(
+                imageSectionHeaders[i].PointerToRawData,
+                imageSectionHeaders[i].VirtualAddress,
+                VA
+            );
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 int main(int argc, char* argv[])
 {
     if (argc < 2)
@@ -113,7 +148,7 @@ int main(int argc, char* argv[])
 
     HANDLE fileHandle = NULL, mappingHandle = NULL;
     BYTE* buffer;
-    
+
 
 
     if (MapPEFile(argv[1], &fileHandle, &mappingHandle, &buffer))
@@ -149,6 +184,8 @@ int main(int argc, char* argv[])
     const IMAGE_SECTION_HEADER* imageSectionHeaders = (const IMAGE_SECTION_HEADER*)((BYTE*)imageDataDirectories
         + imageOptionalHeader->NumberOfRvaAndSizes * sizeof(IMAGE_DATA_DIRECTORY));
 
+    const IMAGE_IMPORT_DESCRIPTOR* importTable = NULL;
+
     PE_DATA data = {
         imageFileHeader->Machine,
         imageFileHeader->NumberOfSections,
@@ -176,15 +213,83 @@ int main(int argc, char* argv[])
         data.Sections[i].FileAddress = imageSectionHeaders[i].PointerToRawData;
         data.Sections[i].Size = imageSectionHeaders[i].SizeOfRawData;
 
-        if (imageSectionHeaders[i].VirtualAddress <= imageOptionalHeader->AddressOfEntryPoint
-            && imageSectionHeaders[i].VirtualAddress + imageSectionHeaders[i].Misc.VirtualSize > imageOptionalHeader->AddressOfEntryPoint)
-            data.AddressOfEntryPoint = (DWORD)((BYTE*)(imageSectionHeaders[i].PointerToRawData)
-                + (imageOptionalHeader->AddressOfEntryPoint - imageSectionHeaders[i].VirtualAddress));
+        if (IsInSection(
+            imageSectionHeaders[i].VirtualAddress,
+            imageSectionHeaders[i].Misc.VirtualSize,
+            imageOptionalHeader->AddressOfEntryPoint))
+        {
+            data.AddressOfEntryPoint = ConvertRVAToFa(
+                imageSectionHeaders[i].PointerToRawData,
+                imageSectionHeaders[i].VirtualAddress,
+                imageOptionalHeader->AddressOfEntryPoint
+            );
+        }
+
+        if (IsInSection(
+            imageSectionHeaders[i].VirtualAddress,
+            imageSectionHeaders[i].Misc.VirtualSize,
+            imageDataDirectories[1].VirtualAddress))
+        {
+            importTable = buffer + ConvertRVAToFa(
+                imageSectionHeaders[i].PointerToRawData,
+                imageSectionHeaders[i].VirtualAddress,
+                imageDataDirectories[1].VirtualAddress
+            );
+        }
     }
 
     PrintData(&data);
 
-    //IMAGE_IMPORT_DESCRIPTOR a;
+    printf("Imports:\n");
+
+    DWORD address;
+    char* DLLName;
+    IMAGE_IMPORT_DESCRIPTOR aux = { 0 };
+
+    const IMAGE_IMPORT_BY_NAME* importedFunctions;
+    const IMAGE_THUNK_DATA32* imageThunkData;
+
+    int i = 0;
+    while (memcmp(importTable + i, &aux, sizeof(IMAGE_IMPORT_DESCRIPTOR)))
+    {
+        if (!FindPA(imageSectionHeaders, data.NumberOfSections, importTable[i].Name, &address))
+        {
+            printf("undef\n");
+            i++;
+            continue;
+        }
+        DLLName = buffer + address;
+
+        if (!FindPA(imageSectionHeaders, data.NumberOfSections, importTable[i].FirstThunk, &address))
+        {
+            printf("undef\n");
+            i++;
+            continue;
+        }
+        imageThunkData = buffer + address;
+
+        while (imageThunkData->u1.AddressOfData != 0)
+        {
+            if (IMAGE_ORDINAL_FLAG & imageThunkData->u1.AddressOfData)
+            {
+                printf("%s,0x%X\n", DLLName, (WORD)imageThunkData->u1.Ordinal);
+            }
+            else
+            {
+                if (!FindPA(imageSectionHeaders, data.NumberOfSections, imageThunkData->u1.AddressOfData, &address))
+                {
+                    printf("undef\n");
+                    continue;
+                }
+                importedFunctions = buffer + address;
+                printf("%s,%s\n", DLLName, importedFunctions->Name);
+            }
+            
+            imageThunkData++;
+        }
+        i++;
+    }
+
 
     free(data.Sections);
     UnmapPEFile(fileHandle, mappingHandle);

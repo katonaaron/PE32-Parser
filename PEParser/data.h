@@ -7,11 +7,6 @@ typedef struct _PE_SECTIONS
     DWORD Size;
 }PE_SECTIONS, *PPE_SECTIONS;
 
-/*typedef struct _PE_IMPORT
-{
-    //DllName
-}PE_IMPORT, *PPE_IMPORT;*/
-
 typedef struct _PE_DATA
 {
     WORD Machine;
